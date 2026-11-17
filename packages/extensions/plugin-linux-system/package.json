@@ -1,0 +1,23 @@
+{
+  "name": "@deepseek-ai/dsh-plugin-linux-system",
+  "description": "Native Linux system capabilities for DeepSeek Harness: systemd, journalctl, clipboard, containers",
+  "version": "0.1.0",
+  "license": "MIT",
+  "type": "module",
+  "main": "lib/index.mjs",
+  "types": "lib/index.d.mts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.mts",
+      "default": "./lib/index.mjs"
+    },
+    "./src/*": "./src/*",
+    "./package.json": "./package.json"
+  },
+  "files": ["lib/index.mjs", "lib/index.d.mts", "src"],
+  "keywords": ["dsh-plugin", "cordis-plugin", "linux", "systemd", "journalctl", "wayland", "clipboard", "podman"],
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/dsh-tools": "*"
+  }
+}

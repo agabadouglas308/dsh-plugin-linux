@@ -1,0 +1,13 @@
+{
+  "name": "dsh-plugin-linux",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "DeepSeek Harness Linux desktop wrapper + native system plugin",
+  "scripts": {
+    "build:plugin": "pnpm -F @deepseek-ai/dsh-plugin-linux-system build",
+    "typecheck": "pnpm -F @deepseek-ai/dsh-plugin-linux-system typecheck",
+    "install-plugin": "./scripts/install-plugin.sh"
+  },
+  "packageManager": "pnpm@10.33.0"
+}

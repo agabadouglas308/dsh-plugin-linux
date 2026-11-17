@@ -1,0 +1,18 @@
+target/
+**/target/
+node_modules/
+**/node_modules/
+.pnpm-store/
+dist/
+**/bundle/
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+.env
+.env.local
+*.log
+
+# Pre-built plugin lib/ is intentionally checked in:
+!packages/extensions/plugin-linux-system/lib/

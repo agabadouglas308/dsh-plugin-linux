@@ -22,8 +22,13 @@ pub fn socket_path() -> PathBuf {
 pub fn prepare_socket() -> Result<PathBuf> {
     let path = socket_path();
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)
-            .with_context(|| format!("create {}", dir.display()))?;
+        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // The socket is a local control channel; keep other users out.
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        }
     }
     if path.exists() {
         let _ = std::fs::remove_file(&path);
@@ -36,8 +41,13 @@ pub fn cleanup(path: &Path) {
 }
 
 pub async fn listen(path: PathBuf) -> Result<()> {
-    let listener = UnixListener::bind(&path)
-        .with_context(|| format!("bind {}", path.display()))?;
+    let listener = UnixListener::bind(&path).with_context(|| format!("bind {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("chmod {}", path.display()))?;
+    }
     tracing::info!(path = %path.display(), "notify socket listening");
     loop {
         match listener.accept().await {
@@ -47,10 +57,17 @@ pub async fn listen(path: PathBuf) -> Result<()> {
                     while let Ok(Some(line)) = lines.next_line().await {
                         match serde_json::from_str::<serde_json::Value>(&line) {
                             Ok(v) => {
-                                let summary = v.get("summary").and_then(|x| x.as_str()).unwrap_or("DeepSeek Harness");
+                                let summary = v
+                                    .get("summary")
+                                    .and_then(|x| x.as_str())
+                                    .unwrap_or("DeepSeek Harness");
                                 let body = v.get("body").and_then(|x| x.as_str()).unwrap_or("");
-                                let urgency = v.get("urgency").and_then(|x| x.as_str()).unwrap_or("normal");
-                                fire(summary.to_string(), body.to_string(), urgency.to_string()).await;
+                                let urgency = v
+                                    .get("urgency")
+                                    .and_then(|x| x.as_str())
+                                    .unwrap_or("normal");
+                                fire(summary.to_string(), body.to_string(), urgency.to_string())
+                                    .await;
                             }
                             Err(e) => tracing::warn!(error = %e, "invalid notify payload"),
                         }

@@ -12,6 +12,7 @@ use once_cell::sync::OnceCell;
 use regex::Regex;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::LazyLock;
 use std::time::Duration;
 use tauri::{
@@ -24,12 +25,15 @@ use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut,
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
-static URL_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"http://127\.0\.0\.1:(\d+)/\?token=([A-Za-z0-9_\-]+)").unwrap()
-});
+static URL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(https?://[^\s/]+)/\?token=([A-Za-z0-9_\-]+)").unwrap());
 
 static BACKEND_PGID: OnceCell<u32> = OnceCell::new();
 static NOTIFY_SOCK: OnceCell<PathBuf> = OnceCell::new();
+/// Whether a tray icon was created; without one, closing the window must exit.
+static TRAY_READY: AtomicBool = AtomicBool::new(false);
+/// Set while a controlled shutdown is in progress so the backend waiter stays quiet.
+static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 
 pub fn run() {
     tracing_subscriber::fmt()
@@ -50,8 +54,17 @@ pub fn run() {
                 .build(),
         )
         .setup(|app| {
-            if let Err(e) = build_tray(app.handle()) {
-                tracing::error!(error = %e, "tray setup failed — continuing without tray");
+            // GUI launches inherit a minimal PATH that often omits npm/nvm
+            // locations. Merge the login-shell PATH before probing for `dsh`.
+            ensure_login_path();
+
+            match build_tray(app.handle()) {
+                Ok(()) => {
+                    TRAY_READY.store(true, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "tray setup failed — window close will quit the app");
+                }
             }
 
             // ── Path 1: X11/XWayland global shortcut (best-effort) ───────
@@ -112,6 +125,24 @@ pub fn run() {
                         .await;
                     }
                 });
+
+                // ── SIGINT / SIGTERM / SIGHUP → clean shutdown ───────────
+                // Without these, Ctrl+C or a session logout can leave the
+                // backend process group running after the wrapper dies.
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    use tokio::signal::unix::{signal, SignalKind};
+                    let mut sigint = signal(SignalKind::interrupt()).ok();
+                    let mut sigterm = signal(SignalKind::terminate()).ok();
+                    let mut sighup = signal(SignalKind::hangup()).ok();
+                    let received = tokio::select! {
+                        _ = async { match sigint.as_mut() { Some(s) => { s.recv().await; }, None => std::future::pending::<()>().await } } => "SIGINT",
+                        _ = async { match sigterm.as_mut() { Some(s) => { s.recv().await; }, None => std::future::pending::<()>().await } } => "SIGTERM",
+                        _ = async { match sighup.as_mut() { Some(s) => { s.recv().await; }, None => std::future::pending::<()>().await } } => "SIGHUP",
+                    };
+                    tracing::info!(signal = received, "terminating wrapper cleanly");
+                    shutdown_and_exit(&handle);
+                });
             }
 
             // ── Notify socket (bridge for backend / plugins) ─────────────
@@ -131,7 +162,7 @@ pub fn run() {
             // ── Spawn backend, then open window ──────────────────────────
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
-                match spawn_backend().await {
+                match spawn_backend(handle.clone()).await {
                     Ok(url) => {
                         tracing::info!(%url, "backend ready, opening window");
                         if let Err(e) = open_main_window(&handle, &url) {
@@ -158,12 +189,102 @@ pub fn run() {
         .expect("error building Tauri app")
         .run(|_app, event| {
             if let RunEvent::Exit = event {
+                SHUTTING_DOWN.store(true, Ordering::SeqCst);
                 kill_backend();
                 if let Some(sock) = NOTIFY_SOCK.get() {
                     notify::cleanup(sock);
                 }
             }
         });
+}
+
+/// Merge the interactive login-shell PATH into this process so GUI launches can
+/// find `dsh`, `node`, and pnpm even when the desktop session PATH is minimal.
+fn ensure_login_path() {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    let login = std::process::Command::new(&shell)
+        .args(["-lc", "printf %s \"$PATH\""])
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .filter(|p| !p.is_empty());
+
+    let Some(login) = login else { return };
+    let current = std::env::var("PATH").unwrap_or_default();
+    let mut parts: Vec<String> = Vec::new();
+    for segment in login.split(':').chain(current.split(':')) {
+        if segment.is_empty() || parts.iter().any(|p| p == segment) {
+            continue;
+        }
+        parts.push(segment.to_string());
+    }
+    // SAFETY: called during single-threaded setup before worker threads probe the environment.
+    std::env::set_var("PATH", parts.join(":"));
+    tracing::debug!(path = %parts.join(":"), "merged login-shell PATH");
+}
+
+/// Resolve `dsh` through the login shell first, then through common install dirs.
+fn find_dsh_on_path() -> Option<PathBuf> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    if let Ok(out) = std::process::Command::new(&shell)
+        .args(["-lc", "command -v dsh"])
+        .stderr(Stdio::null())
+        .output()
+    {
+        if out.status.success() {
+            let candidate = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            // `command -v` prints a bare name for shell functions/builtins;
+            // only trust actual paths here.
+            if candidate.starts_with('/') || candidate.contains('/') {
+                return Some(PathBuf::from(candidate));
+            }
+        }
+    }
+
+    let mut dirs: Vec<PathBuf> = std::env::var("PATH")
+        .unwrap_or_default()
+        .split(':')
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .collect();
+    if let Ok(home) = std::env::var("HOME") {
+        for rel in [
+            ".local/bin",
+            ".npm-global/bin",
+            ".bun/bin",
+            ".cargo/bin",
+            ".local/share/pnpm",
+        ] {
+            dirs.push(PathBuf::from(&home).join(rel));
+        }
+    }
+    for dir in [
+        "/usr/local/bin",
+        "/usr/bin",
+        "/bin",
+        "/home/linuxbrew/.linuxbrew/bin",
+        "/opt/homebrew/bin",
+    ] {
+        dirs.push(PathBuf::from(dir));
+    }
+
+    dirs.into_iter()
+        .map(|dir| dir.join("dsh"))
+        .find(|candidate| candidate.is_file())
+}
+
+/// Idempotent controlled shutdown: stop the backend, remove the socket, exit.
+fn shutdown_and_exit(app: &tauri::AppHandle) {
+    if SHUTTING_DOWN.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    kill_backend();
+    if let Some(sock) = NOTIFY_SOCK.get() {
+        notify::cleanup(sock);
+    }
+    app.exit(0);
 }
 
 fn toggle_main_window(app: &tauri::AppHandle) {
@@ -203,8 +324,7 @@ fn build_tray(app: &tauri::AppHandle) -> Result<()> {
                 }
             }
             "quit" => {
-                kill_backend();
-                app.exit(0);
+                shutdown_and_exit(app);
             }
             _ => {}
         })
@@ -229,14 +349,22 @@ fn build_tray(app: &tauri::AppHandle) -> Result<()> {
 }
 
 fn kill_backend() {
-    let Some(&pgid) = BACKEND_PGID.get() else { return };
+    let Some(&pgid) = BACKEND_PGID.get() else {
+        return;
+    };
     tracing::info!(pgid, "killing backend process group");
     let _ = std::process::Command::new("sh")
-        .args(["-c", &format!("kill -TERM -- -{} 2>/dev/null || true", pgid)])
+        .args([
+            "-c",
+            &format!("kill -TERM -- -{} 2>/dev/null || true", pgid),
+        ])
         .status();
     std::thread::sleep(Duration::from_millis(400));
     let _ = std::process::Command::new("sh")
-        .args(["-c", &format!("kill -KILL -- -{} 2>/dev/null || true", pgid)])
+        .args([
+            "-c",
+            &format!("kill -KILL -- -{} 2>/dev/null || true", pgid),
+        ])
         .status();
 }
 
@@ -252,9 +380,13 @@ fn open_main_window(app: &tauri::AppHandle, url: &str) -> Result<()> {
     let win_for_close = win.clone();
     win.on_window_event(move |event| {
         if let WindowEvent::CloseRequested { api, .. } = event {
-            api.prevent_close();
-            if let Err(e) = win_for_close.hide() {
-                tracing::warn!(error = %e, "hide-on-close failed");
+            // Closing to the tray only makes sense when a tray exists; otherwise
+            // the app would become unreachable, so let the window close.
+            if TRAY_READY.load(Ordering::Relaxed) {
+                api.prevent_close();
+                if let Err(e) = win_for_close.hide() {
+                    tracing::warn!(error = %e, "hide-on-close failed");
+                }
             }
         }
     });
@@ -305,23 +437,14 @@ fn locate_dsh_backend() -> Result<DshBackend> {
     }
 
     // 3. `dsh` on PATH (global install)
-    if let Ok(out) = std::process::Command::new("sh")
-        .arg("-c")
-        .arg("command -v dsh")
-        .output()
-    {
-        if out.status.success() {
-            let bin = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !bin.is_empty() {
-                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                return Ok(DshBackend {
-                    bin,
-                    prefix_args: vec![],
-                    workdir: cwd,
-                    note: "dsh on PATH (global install)",
-                });
-            }
-        }
+    if let Some(bin) = find_dsh_on_path() {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        return Ok(DshBackend {
+            bin: bin.to_string_lossy().into_owned(),
+            prefix_args: vec![],
+            workdir: cwd,
+            note: "dsh on PATH (global install)",
+        });
     }
 
     Err(anyhow!(
@@ -332,7 +455,7 @@ fn locate_dsh_backend() -> Result<DshBackend> {
     ))
 }
 
-async fn spawn_backend() -> Result<String> {
+async fn spawn_backend(app: tauri::AppHandle) -> Result<String> {
     let backend = locate_dsh_backend()?;
     tracing::info!(
         bin = %backend.bin,
@@ -373,7 +496,7 @@ async fn spawn_backend() -> Result<String> {
         while let Ok(Some(line)) = lines.next_line().await {
             tracing::debug!(target: "dsh.stdout", "{}", line);
             if let Some(c) = URL_RE.captures(&line) {
-                let url = format!("http://127.0.0.1:{}/?token={}", &c[1], &c[2]);
+                let url = format!("{}/?token={}", &c[1], &c[2]);
                 if let Some(s) = tx.lock().await.take() {
                     let _ = s.send(url);
                 }
@@ -389,15 +512,21 @@ async fn spawn_backend() -> Result<String> {
         }
     });
 
-    let url = match tokio::time::timeout(Duration::from_secs(60), rx).await {
+    let startup_secs = std::env::var("DSH_STARTUP_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(120);
+
+    let url = match tokio::time::timeout(Duration::from_secs(startup_secs), rx).await {
         Ok(Ok(u)) => u,
         Ok(Err(_)) => return Err(anyhow!("backend stdout closed before URL")),
-        Err(_) => return Err(anyhow!("backend did not print URL in 60s")),
+        Err(_) => return Err(anyhow!("backend did not print URL in {startup_secs}s")),
     };
 
     let authority = url
-        .strip_prefix("http://")
-        .and_then(|s| s.split('/').next())
+        .split_once("://")
+        .and_then(|(_, rest)| rest.split('/').next())
         .ok_or_else(|| anyhow!("malformed URL: {url}"))?
         .to_owned();
 
@@ -411,16 +540,22 @@ async fn spawn_backend() -> Result<String> {
     tokio::spawn(async move {
         let exit = child.wait().await;
         tracing::info!(?exit, "backend exited");
-        if let Ok(status) = exit {
-            if !status.success() {
-                notify::fire(
-                    "DeepSeek Harness".into(),
-                    format!("Backend exited with status {status}"),
-                    "critical".into(),
-                )
-                .await;
-            }
+        if SHUTTING_DOWN.load(Ordering::SeqCst) {
+            return;
         }
+        let failed = !matches!(&exit, Ok(status) if status.success());
+        if failed {
+            notify::fire(
+                "DeepSeek Harness".into(),
+                format!("Backend exited unexpectedly ({exit:?})"),
+                "critical".into(),
+            )
+            .await;
+        }
+        // The window now points at a dead server; close the wrapper instead of
+        // leaving a blank, unusable window behind.
+        SHUTTING_DOWN.store(true, Ordering::SeqCst);
+        app.exit(if failed { 1 } else { 0 });
     });
 
     Ok(url)

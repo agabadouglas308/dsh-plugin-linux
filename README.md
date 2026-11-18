@@ -29,9 +29,10 @@ Cordis plugin registering **7 tools** with the agent:
 
 ## Prerequisites
 
-1. **Node.js >= 22** — `sudo dnf install -y nodejs` (Fedora) or `sudo apt install -y nodejs` (Debian/Ubuntu)
-2. **DeepSeek Harness backend** — `npm install -g @deepseek-ai/dsh`. Verify with `command -v dsh`
+1. **Node.js >= 24.9** — `sudo dnf install -y nodejs` (Fedora) or `sudo apt install -y nodejs` (Debian/Ubuntu). DeepSeek Harness 0.2.x declares `node >= 24.9`; Node 22 is **not** supported.
+2. **DeepSeek Harness backend** — `npm install -g @deepseek-ai/dsh`. Verify with `command -v dsh`.
 3. **DeepSeek account with API quota** — the agent needs it to respond; plugin loads without it
+4. **pnpm 10** (optional) — only needed for `dsh plugin add/remove`; `scripts/install-plugin.sh` does not require it
 
 ## Installation
 
@@ -75,32 +76,49 @@ Then in GNOME Settings → Keyboard → Custom Shortcuts, bind `Ctrl+Shift+D` to
     cd dsh-plugin-linux
     ./scripts/install-plugin.sh
 
-No `pnpm install` needed — the plugin ships pre-built (`lib/index.mjs`).
+The plugin ships pre-built (`lib/index.mjs`) and is also a proper dsh **bundle**
+(`package.json` → `dsh.bundle` + `cordis.patch.yml`). The installer links the
+checkout into the profile, adds it to `dsh.profile.bundles`, removes the broken
+patch row written by v0.1.0 installers, and verifies the composed profile with
+`dsh --profile web --dump-config`.
 
-Restart `dsh-desktop-linux`. Verify in **Settings → Built-in plugins → search `linux-system`**. Status should show **Running**.
+It does **not** run `pnpm install`, so no network access or pnpm is required.
+Profiles are read from `$DSH_HOME/profiles/<name>` (default `web`).
+
+Restart `dsh-desktop-linux`. Verify in **Settings → Plugins → search `linux-system`**. Status should show **Running**.
 
 Test: in the chat panel, ask the agent "What is the status of sshd.service? Use the linux_systemd_status tool."
 
 ## Troubleshooting
 
-- **Backend failed to start: no dsh backend found** — run `npm install -g @deepseek-ai/dsh`, ensure `command -v dsh` resolves
-- **Window blank for >60s** — check terminal for `dsh.stderr` lines
+- **Backend failed to start: no dsh backend found** — run `npm install -g @deepseek-ai/dsh`, ensure `command -v dsh` resolves. GUI launches inherit a minimal PATH; the wrapper now merges your login-shell PATH, but `~/.npm-global/bin` and nvm paths must be exported from your shell profile.
+- **`failed to parse overlay ... cordis.patch.yml`** — a v0.1.0 installer appended a `- insert:` row after the stock `[]`, which is invalid YAML. Rerun `./scripts/install-plugin.sh`; it removes the legacy row and registers the bundle instead.
+- **Window blank for >120s** — check terminal for `dsh.stderr` lines. Set `DSH_STARTUP_TIMEOUT_SECS=240` for a slow first boot.
 - **ACCOUNT_QUOTA in chat** — DeepSeek API quota exhausted, unrelated to wrapper
 - **Ctrl+Shift+D does nothing (Wayland)** — use the SIGUSR1 fallback above
-- **Plugin not in Settings** — rerun `./scripts/install-plugin.sh`, restart app
+- **No tray icon, or window close quits** — `libayatana-appindicator3` is missing; install it to restore close-to-tray.
+- **Plugin not in Settings** — rerun `./scripts/install-plugin.sh`, check its verification step, then restart the app
 
 ## Development
 
-    git clone https://github.com/deepseek-ai/deepseek-harness.git
-    cd deepseek-harness/apps/desktop-linux
-    cargo build              # dev build
-    cargo tauri build --bundles deb,rpm,appimage
+    git clone https://github.com/agabadouglas308/dsh-plugin-linux.git
+    cd dsh-plugin-linux
+    pnpm install                  # Node 24.11+ required by tsdown; installs the type definitions
+    pnpm build:plugin             # rebuild packages/extensions/plugin-linux-system/lib
+    pnpm typecheck
+
+    cd apps/desktop-linux
+    cargo build                   # dev build (Rust 1.90+)
+    cargo tauri build --bundles deb,rpm,appimage   # needs tauri-cli ^2 and WebKitGTK dev packages
+
+To work against a source checkout of the harness, set `DSH_REPO=/path/to/deepseek-harness`.
 
 Environment variables:
 
 - `DSH_REPO` — path to a deepseek-harness checkout (dev mode; overrides `dsh` on PATH)
 - `DSH_PROFILE` — which profile to install the plugin into (default: `web`)
 - `DSH_HOME` — DSH home root (default: `~/.dsh`)
+- `DSH_STARTUP_TIMEOUT_SECS` — backend URL wait budget (default: `120`)
 - `RUST_LOG=dsh_desktop_linux=debug` — verbose wrapper logging
 
 ## License

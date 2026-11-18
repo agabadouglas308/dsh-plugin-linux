@@ -1,0 +1,5 @@
+# Bundle layer for the linux-system plugin. The profile loader applies this
+# patch when the package is listed in dsh.profile.bundles.
+- insert:
+    - id: linux-system
+      name: '@deepseek-ai/dsh-plugin-linux-system'

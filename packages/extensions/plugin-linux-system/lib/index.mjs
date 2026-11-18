@@ -2,36 +2,60 @@ import { defineTool } from "@deepseek-ai/dsh-tools";
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import net from "node:net";
-//#region src/index.ts
+// src/index.ts
 const execFileP = promisify(execFile);
 const name = "plugin-linux-system";
 const inject = ["tools"];
-async function runCmd(cmd, args, timeoutMs = 15e3) {
+async function runCmd(cmd, args, timeoutMs = 15e3, options = {}) {
+	if (options.signal?.aborted) throw new Error(`${cmd} aborted before start`);
 	const { stdout, stderr } = await execFileP(cmd, args, {
 		timeout: timeoutMs,
-		maxBuffer: 8 * 1024 * 1024
+		maxBuffer: 8388608,
+		signal: options.signal
 	});
 	return {
 		stdout: String(stdout),
 		stderr: String(stderr)
 	};
 }
-function spawnWithStdin(cmd, args, input) {
+function spawnWithStdin(cmd, args, input, { timeoutMs = 5e3, signal } = {}) {
 	return new Promise((resolve, reject) => {
+		if (signal?.aborted) {
+			reject(/* @__PURE__ */ new Error(`${cmd} aborted before start`));
+			return;
+		}
 		const child = spawn(cmd, args, { stdio: [
 			"pipe",
 			"ignore",
 			"pipe"
 		] });
 		const errChunks = [];
+		let settled = false;
+		const finish = (error) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", onAbort);
+			if (error) reject(error);
+			else resolve();
+		};
+		const onAbort = () => {
+			child.kill("SIGKILL");
+			finish(/* @__PURE__ */ new Error(`${cmd} aborted`));
+		};
+		const timer = setTimeout(() => {
+			child.kill("SIGKILL");
+			finish(/* @__PURE__ */ new Error(`${cmd} timed out after ${timeoutMs}ms`));
+		}, timeoutMs);
+		signal?.addEventListener("abort", onAbort, { once: true });
 		child.stderr?.on("data", (d) => errChunks.push(d));
-		child.on("error", reject);
+		child.on("error", (e) => finish(e));
 		child.on("close", (code) => {
 			if (code === 0) {
-				resolve();
+				finish();
 				return;
 			}
-			reject(/* @__PURE__ */ new Error(`${cmd} exited ${code}: ${Buffer.concat(errChunks).toString("utf8").trim()}`));
+			finish(/* @__PURE__ */ new Error(`${cmd} exited ${code}: ${Buffer.concat(errChunks).toString("utf8").trim()}`));
 		});
 		child.stdin?.end(input);
 	});
@@ -39,14 +63,14 @@ function spawnWithStdin(cmd, args, input) {
 function scopeArgs(scope) {
 	return scope === "user" ? ["--user"] : [];
 }
-async function readClipboard() {
+async function readClipboard(options = {}) {
 	const errors = [];
 	if (process.env.WAYLAND_DISPLAY) try {
 		return (await runCmd("wl-paste", [
 			"--no-newline",
 			"--type",
 			"text/plain"
-		], 3e3)).stdout;
+		], 3e3, options)).stdout;
 	} catch (e) {
 		errors.push(String(e));
 	}
@@ -55,40 +79,40 @@ async function readClipboard() {
 			"-selection",
 			"clipboard",
 			"-o"
-		], 3e3)).stdout;
+		], 3e3, options)).stdout;
 	} catch (e) {
 		errors.push(String(e));
 	}
 	try {
-		return (await runCmd("xsel", ["--clipboard", "--output"], 3e3)).stdout;
+		return (await runCmd("xsel", ["--clipboard", "--output"], 3e3, options)).stdout;
 	} catch (e) {
 		errors.push(String(e));
 	}
 	throw new Error("No clipboard reader available (wl-paste / xclip / xsel). Errors:\n" + errors.join("\n"));
 }
-async function writeClipboard(text) {
+async function writeClipboard(text, options = {}) {
 	const errors = [];
 	if (process.env.WAYLAND_DISPLAY) try {
-		await spawnWithStdin("wl-copy", ["--type", "text/plain"], text);
+		await spawnWithStdin("wl-copy", ["--type", "text/plain"], text, options);
 		return;
 	} catch (e) {
 		errors.push(String(e));
 	}
 	try {
-		await spawnWithStdin("xclip", ["-selection", "clipboard"], text);
+		await spawnWithStdin("xclip", ["-selection", "clipboard"], text, options);
 		return;
 	} catch (e) {
 		errors.push(String(e));
 	}
 	try {
-		await spawnWithStdin("xsel", ["--clipboard", "--input"], text);
+		await spawnWithStdin("xsel", ["--clipboard", "--input"], text, options);
 		return;
 	} catch (e) {
 		errors.push(String(e));
 	}
 	throw new Error("No clipboard writer available (wl-copy / xclip / xsel). Errors:\n" + errors.join("\n"));
 }
-async function sendNotification(args) {
+async function sendNotification(args, options = {}) {
 	const payload = JSON.stringify({
 		summary: args.summary,
 		body: args.body ?? "",
@@ -98,26 +122,48 @@ async function sendNotification(args) {
 	if (sockPath) try {
 		await new Promise((resolve, reject) => {
 			const c = net.createConnection(sockPath);
+			let settled = false;
+			const finish = (error) => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(timer);
+				options.signal?.removeEventListener("abort", onAbort);
+				if (error) {
+					c.destroy();
+					reject(error);
+				} else resolve();
+			};
+			const onAbort = () => {
+				c.destroy();
+				finish(/* @__PURE__ */ new Error("notification aborted"));
+			};
+			const timer = setTimeout(() => finish(/* @__PURE__ */ new Error("notification socket timed out")), 3e3);
+			options.signal?.addEventListener("abort", onAbort, { once: true });
 			c.on("connect", () => {
 				c.write(payload + "\n");
 				c.end();
 			});
-			c.on("end", () => resolve());
-			c.on("error", (e) => reject(e));
+			c.on("end", () => finish());
+			c.on("close", () => finish());
+			c.on("error", (e) => finish(e));
 		});
 		return {
 			ok: true,
 			via: "socket"
 		};
 	} catch {}
+	const urgency = args.urgency === "critical" ? "critical" : args.urgency === "low" ? "low" : "normal";
 	await execFileP("notify-send", [
 		"-a",
 		"DeepSeek Harness",
 		"-u",
-		args.urgency === "critical" ? "critical" : args.urgency === "low" ? "low" : "normal",
+		urgency,
 		args.summary,
 		args.body ?? ""
-	], { timeout: 5e3 });
+	], {
+		timeout: 5e3,
+		signal: options.signal
+	});
 	return {
 		ok: true,
 		via: "notify-send"
@@ -147,7 +193,7 @@ function apply(ctx) {
 			}]
 		},
 		isConcurrencySafe: () => true,
-		async execute(args) {
+		async execute(args, exec = {}) {
 			const scope = args.scope ?? "system";
 			const { stdout } = await runCmd("systemctl", [
 				...scopeArgs(scope),
@@ -155,7 +201,7 @@ function apply(ctx) {
 				args.unit,
 				"--property=LoadState,ActiveState,SubState,UnitFileState,MainPID,Description,FragmentPath,ExecMainStartTimestamp",
 				"--no-pager"
-			]);
+			], 15e3, exec);
 			const info = {};
 			for (const line of stdout.trim().split("\n")) {
 				const eq = line.indexOf("=");
@@ -203,13 +249,13 @@ function apply(ctx) {
 			}]
 		},
 		isConcurrencySafe: () => false,
-		async execute(args) {
+		async execute(args, exec = {}) {
 			const scope = args.scope ?? "system";
 			const { stdout, stderr } = await runCmd("systemctl", [
 				...scopeArgs(scope),
 				args.action,
 				args.unit
-			]);
+			], 15e3, exec);
 			return {
 				unit: args.unit,
 				action: args.action,
@@ -228,8 +274,8 @@ function apply(ctx) {
 				description: "Filter by systemd unit (optional)."
 			},
 			lines: {
-				type: "number",
-				description: "Max entries to return. Default 100."
+				type: "integer",
+				description: "Max entries to return (1-10000). Default 100."
 			},
 			since: {
 				type: "string",
@@ -244,16 +290,17 @@ function apply(ctx) {
 			}]
 		},
 		isConcurrencySafe: () => true,
-		async execute(args) {
+		async execute(args, exec = {}) {
+			const lines = Math.min(Math.max(Math.trunc(args.lines ?? 100), 1), 1e4);
 			const argv = [
 				"--no-pager",
 				"--output=json",
 				"-n",
-				String(args.lines ?? 100)
+				String(lines)
 			];
 			if (args.unit) argv.push("-u", args.unit);
 			if (args.since) argv.push("--since", args.since);
-			const { stdout } = await runCmd("journalctl", argv, 2e4);
+			const { stdout } = await runCmd("journalctl", argv, 2e4, exec);
 			const entries = [];
 			for (const line of stdout.trim().split("\n")) {
 				if (!line) continue;
@@ -282,8 +329,8 @@ function apply(ctx) {
 			}]
 		},
 		isConcurrencySafe: () => true,
-		async execute() {
-			const text = await readClipboard();
+		async execute(_args, exec = {}) {
+			const text = await readClipboard(exec);
 			return {
 				text,
 				length: text.length
@@ -306,8 +353,8 @@ function apply(ctx) {
 			}]
 		},
 		isConcurrencySafe: () => false,
-		async execute(args) {
-			await writeClipboard(args.text);
+		async execute(args, exec = {}) {
+			await writeClipboard(args.text, exec);
 			return {
 				ok: true,
 				length: args.text.length
@@ -326,14 +373,14 @@ function apply(ctx) {
 			}]
 		},
 		isConcurrencySafe: () => true,
-		async execute() {
+		async execute(_args, exec = {}) {
 			const errors = [];
 			for (const runtime of ["podman", "docker"]) try {
 				const { stdout } = await runCmd(runtime, [
 					"ps",
 					"--format",
 					"json"
-				], 1e4);
+				], 1e4, exec);
 				let containers;
 				try {
 					containers = JSON.parse(stdout);
@@ -381,10 +428,9 @@ function apply(ctx) {
 			}]
 		},
 		isConcurrencySafe: () => true,
-		async execute(args) {
-			return await sendNotification(args);
+		async execute(args, exec = {}) {
+			return await sendNotification(args, exec);
 		}
 	}));
 }
-//#endregion
 export { apply, inject, name };

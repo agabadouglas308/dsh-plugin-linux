@@ -6,5 +6,5 @@ export default defineConfig({
   dts: true,
   clean: true,
   outDir: 'lib',
-  target: 'node22',
+  target: 'node24',
 })

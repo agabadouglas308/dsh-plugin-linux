@@ -17,21 +17,67 @@ export const name = 'plugin-linux-system'
 export const inject = ['tools']
 
 type Scope = 'system' | 'user'
+/** Lossless JSON value accepted by tool outputs. */
+type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue }
+/** Subset of the harness ToolRunContext this plugin consumes. */
+type ToolExec = { signal?: AbortSignal }
 
-async function runCmd(cmd: string, args: string[], timeoutMs = 15_000): Promise<{ stdout: string; stderr: string }> {
-  const { stdout, stderr } = await execFileP(cmd, args, { timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024 })
+interface RunOptions {
+  /** Cooperative cancellation forwarded from the agent's tool call. */
+  signal?: AbortSignal
+}
+
+async function runCmd(
+  cmd: string,
+  args: string[],
+  timeoutMs = 15_000,
+  options: RunOptions = {},
+): Promise<{ stdout: string; stderr: string }> {
+  if (options.signal?.aborted) throw new Error(`${cmd} aborted before start`)
+  const { stdout, stderr } = await execFileP(cmd, args, {
+    timeout: timeoutMs,
+    maxBuffer: 8 * 1024 * 1024,
+    signal: options.signal,
+  })
   return { stdout: String(stdout), stderr: String(stderr) }
 }
 
-function spawnWithStdin(cmd: string, args: string[], input: string): Promise<void> {
+function spawnWithStdin(
+  cmd: string,
+  args: string[],
+  input: string,
+  { timeoutMs = 5_000, signal }: { timeoutMs?: number; signal?: AbortSignal } = {},
+): Promise<void> {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new Error(`${cmd} aborted before start`))
+      return
+    }
     const child = spawn(cmd, args, { stdio: ['pipe', 'ignore', 'pipe'] })
     const errChunks: Buffer[] = []
+    let settled = false
+    const finish = (error?: Error): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', onAbort)
+      if (error) reject(error)
+      else resolve()
+    }
+    const onAbort = (): void => {
+      child.kill('SIGKILL')
+      finish(new Error(`${cmd} aborted`))
+    }
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL')
+      finish(new Error(`${cmd} timed out after ${timeoutMs}ms`))
+    }, timeoutMs)
+    signal?.addEventListener('abort', onAbort, { once: true })
     child.stderr?.on('data', (d: Buffer) => errChunks.push(d))
-    child.on('error', reject)
+    child.on('error', (e) => finish(e))
     child.on('close', (code) => {
-      if (code === 0) { resolve(); return }
-      reject(new Error(`${cmd} exited ${code}: ${Buffer.concat(errChunks).toString('utf8').trim()}`))
+      if (code === 0) { finish(); return }
+      finish(new Error(`${cmd} exited ${code}: ${Buffer.concat(errChunks).toString('utf8').trim()}`))
     })
     child.stdin?.end(input)
   })
@@ -41,23 +87,23 @@ function scopeArgs(scope: Scope): string[] {
   return scope === 'user' ? ['--user'] : []
 }
 
-async function readClipboard(): Promise<string> {
+async function readClipboard(options: RunOptions = {}): Promise<string> {
   const errors: string[] = []
   if (process.env.WAYLAND_DISPLAY) {
-    try { return (await runCmd('wl-paste', ['--no-newline', '--type', 'text/plain'], 3000)).stdout } catch (e) { errors.push(String(e)) }
+    try { return (await runCmd('wl-paste', ['--no-newline', '--type', 'text/plain'], 3000, options)).stdout } catch (e) { errors.push(String(e)) }
   }
-  try { return (await runCmd('xclip', ['-selection', 'clipboard', '-o'], 3000)).stdout } catch (e) { errors.push(String(e)) }
-  try { return (await runCmd('xsel', ['--clipboard', '--output'], 3000)).stdout } catch (e) { errors.push(String(e)) }
+  try { return (await runCmd('xclip', ['-selection', 'clipboard', '-o'], 3000, options)).stdout } catch (e) { errors.push(String(e)) }
+  try { return (await runCmd('xsel', ['--clipboard', '--output'], 3000, options)).stdout } catch (e) { errors.push(String(e)) }
   throw new Error('No clipboard reader available (wl-paste / xclip / xsel). Errors:\n' + errors.join('\n'))
 }
 
-async function writeClipboard(text: string): Promise<void> {
+async function writeClipboard(text: string, options: RunOptions = {}): Promise<void> {
   const errors: string[] = []
   if (process.env.WAYLAND_DISPLAY) {
-    try { await spawnWithStdin('wl-copy', ['--type', 'text/plain'], text); return } catch (e) { errors.push(String(e)) }
+    try { await spawnWithStdin('wl-copy', ['--type', 'text/plain'], text, options); return } catch (e) { errors.push(String(e)) }
   }
-  try { await spawnWithStdin('xclip', ['-selection', 'clipboard'], text); return } catch (e) { errors.push(String(e)) }
-  try { await spawnWithStdin('xsel', ['--clipboard', '--input'], text); return } catch (e) { errors.push(String(e)) }
+  try { await spawnWithStdin('xclip', ['-selection', 'clipboard'], text, options); return } catch (e) { errors.push(String(e)) }
+  try { await spawnWithStdin('xsel', ['--clipboard', '--input'], text, options); return } catch (e) { errors.push(String(e)) }
   throw new Error('No clipboard writer available (wl-copy / xclip / xsel). Errors:\n' + errors.join('\n'))
 }
 
@@ -65,7 +111,7 @@ async function sendNotification(args: {
   summary: string
   body?: string
   urgency?: 'low' | 'normal' | 'critical'
-}): Promise<{ ok: true; via: 'socket' | 'notify-send' }> {
+}, options: RunOptions = {}): Promise<{ ok: true; via: 'socket' | 'notify-send' }> {
   const payload = JSON.stringify({
     summary: args.summary,
     body: args.body ?? '',
@@ -76,9 +122,24 @@ async function sendNotification(args: {
     try {
       await new Promise<void>((resolve, reject) => {
         const c = net.createConnection(sockPath)
+        let settled = false
+        const finish = (error?: Error): void => {
+          if (settled) return
+          settled = true
+          clearTimeout(timer)
+          options.signal?.removeEventListener('abort', onAbort)
+          if (error) { c.destroy(); reject(error) } else resolve()
+        }
+        const onAbort = (): void => {
+          c.destroy()
+          finish(new Error('notification aborted'))
+        }
+        const timer = setTimeout(() => finish(new Error('notification socket timed out')), 3000)
+        options.signal?.addEventListener('abort', onAbort, { once: true })
         c.on('connect', () => { c.write(payload + '\n'); c.end() })
-        c.on('end', () => resolve())
-        c.on('error', (e) => reject(e))
+        c.on('end', () => finish())
+        c.on('close', () => finish())
+        c.on('error', (e) => finish(e))
       })
       return { ok: true, via: 'socket' }
     } catch {
@@ -86,7 +147,10 @@ async function sendNotification(args: {
     }
   }
   const urgency = args.urgency === 'critical' ? 'critical' : args.urgency === 'low' ? 'low' : 'normal'
-  await execFileP('notify-send', ['-a', 'DeepSeek Harness', '-u', urgency, args.summary, args.body ?? ''], { timeout: 5000 })
+  await execFileP('notify-send', ['-a', 'DeepSeek Harness', '-u', urgency, args.summary, args.body ?? ''], {
+    timeout: 5000,
+    signal: options.signal,
+  })
   return { ok: true, via: 'notify-send' }
 }
 
@@ -105,10 +169,10 @@ export function apply(ctx: Context): void {
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
     },
     isConcurrencySafe: () => true,
-    async execute(args: { unit: string; scope?: Scope }) {
+    async execute(args: { unit: string; scope?: Scope }, exec: ToolExec = {}) {
       const scope: Scope = args.scope ?? 'system'
       const props = 'LoadState,ActiveState,SubState,UnitFileState,MainPID,Description,FragmentPath,ExecMainStartTimestamp'
-      const { stdout } = await runCmd('systemctl', [...scopeArgs(scope), 'show', args.unit, '--property=' + props, '--no-pager'])
+      const { stdout } = await runCmd('systemctl', [...scopeArgs(scope), 'show', args.unit, '--property=' + props, '--no-pager'], 15_000, exec)
       const info: Record<string, string> = {}
       for (const line of stdout.trim().split('\n')) {
         const eq = line.indexOf('=')
@@ -132,9 +196,9 @@ export function apply(ctx: Context): void {
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
     },
     isConcurrencySafe: () => false,
-    async execute(args: { unit: string; action: 'start' | 'stop' | 'restart' | 'enable' | 'disable'; scope?: Scope }) {
+    async execute(args: { unit: string; action: 'start' | 'stop' | 'restart' | 'enable' | 'disable'; scope?: Scope }, exec: ToolExec = {}) {
       const scope: Scope = args.scope ?? 'system'
-      const { stdout, stderr } = await runCmd('systemctl', [...scopeArgs(scope), args.action, args.unit])
+      const { stdout, stderr } = await runCmd('systemctl', [...scopeArgs(scope), args.action, args.unit], 15_000, exec)
       return { unit: args.unit, action: args.action, scope, stdout: stdout.trim(), stderr: stderr.trim() }
     },
   }))
@@ -145,7 +209,7 @@ export function apply(ctx: Context): void {
     description: 'Read structured journalctl entries. Optionally filter by unit and time window. Returns one JSON object per journal entry.',
     parameters: {
       unit: { type: 'string', description: 'Filter by systemd unit (optional).' },
-      lines: { type: 'number', description: 'Max entries to return. Default 100.' },
+      lines: { type: 'integer', description: 'Max entries to return (1-10000). Default 100.' },
       since: { type: 'string', description: 'Time window, e.g. "10 min ago" or "2024-01-01 12:00".' },
     },
     output: {
@@ -153,15 +217,17 @@ export function apply(ctx: Context): void {
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
     },
     isConcurrencySafe: () => true,
-    async execute(args: { unit?: string; lines?: number; since?: string }) {
-      const argv = ['--no-pager', '--output=json', '-n', String(args.lines ?? 100)]
+    async execute(args: { unit?: string; lines?: number; since?: string }, exec: ToolExec = {}) {
+      // Keep journalctl bounded even if the model asks for an extreme count.
+      const lines = Math.min(Math.max(Math.trunc(args.lines ?? 100), 1), 10_000)
+      const argv = ['--no-pager', '--output=json', '-n', String(lines)]
       if (args.unit) argv.push('-u', args.unit)
       if (args.since) argv.push('--since', args.since)
-      const { stdout } = await runCmd('journalctl', argv, 20_000)
-      const entries: unknown[] = []
+      const { stdout } = await runCmd('journalctl', argv, 20_000, exec)
+      const entries: JsonValue[] = []
       for (const line of stdout.trim().split('\n')) {
         if (!line) continue
-        try { entries.push(JSON.parse(line)) } catch { entries.push({ MESSAGE: line }) }
+        try { entries.push(JSON.parse(line) as JsonValue) } catch { entries.push({ MESSAGE: line }) }
       }
       return { unit: args.unit ?? null, count: entries.length, entries }
     },
@@ -177,8 +243,8 @@ export function apply(ctx: Context): void {
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
     },
     isConcurrencySafe: () => true,
-    async execute() {
-      const text = await readClipboard()
+    async execute(_args: unknown, exec: ToolExec = {}) {
+      const text = await readClipboard(exec)
       return { text, length: text.length }
     },
   }))
@@ -195,8 +261,8 @@ export function apply(ctx: Context): void {
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
     },
     isConcurrencySafe: () => false,
-    async execute(args: { text: string }) {
-      await writeClipboard(args.text)
+    async execute(args: { text: string }, exec: ToolExec = {}) {
+      await writeClipboard(args.text, exec)
       return { ok: true, length: args.text.length }
     },
   }))
@@ -211,13 +277,13 @@ export function apply(ctx: Context): void {
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
     },
     isConcurrencySafe: () => true,
-    async execute() {
+    async execute(_args: unknown, exec: ToolExec = {}) {
       const errors: string[] = []
       for (const runtime of ['podman', 'docker'] as const) {
         try {
-          const { stdout } = await runCmd(runtime, ['ps', '--format', 'json'], 10_000)
-          let containers: unknown
-          try { containers = JSON.parse(stdout) } catch { containers = stdout.trim() }
+          const { stdout } = await runCmd(runtime, ['ps', '--format', 'json'], 10_000, exec)
+          let containers: JsonValue
+          try { containers = JSON.parse(stdout) as JsonValue } catch { containers = stdout.trim() }
           return { runtime, containers }
         } catch (e) { errors.push(`${runtime}: ${String(e)}`) }
       }
@@ -240,8 +306,8 @@ export function apply(ctx: Context): void {
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
     },
     isConcurrencySafe: () => true,
-    async execute(args: { summary: string; body?: string; urgency?: 'low' | 'normal' | 'critical' }) {
-      return await sendNotification(args)
+    async execute(args: { summary: string; body?: string; urgency?: 'low' | 'normal' | 'critical' }, exec: ToolExec = {}) {
+      return await sendNotification(args, exec)
     },
   }))
 }

@@ -7,10 +7,29 @@
 //!      Payload: {"summary":"...","body":"...","urgency":"low|normal|critical"}
 //!      The `dsh` backend and its plugins inherit DSH_NOTIFY_SOCK pointing at it.
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::UnixListener;
+
+/// Notification priority. Kept as a type so urgency cannot drift between the
+/// wrapper, the socket payload and the plugin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Urgency {
+    Low,
+    Normal,
+    Critical,
+}
+
+impl Urgency {
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "low" => Self::Low,
+            "critical" => Self::Critical,
+            _ => Self::Normal,
+        }
+    }
+}
 
 pub fn socket_path() -> PathBuf {
     let base = std::env::var("XDG_RUNTIME_DIR")
@@ -19,6 +38,11 @@ pub fn socket_path() -> PathBuf {
     base.join("dsh-desktop-linux").join("notify.sock")
 }
 
+/// Prepare the socket path without stealing a socket owned by a live wrapper.
+///
+/// A successful `connect` proves another instance is listening; in that case
+/// we fail instead of unlinking its socket and splitting the notification
+/// channel between two wrappers.
 pub fn prepare_socket() -> Result<PathBuf> {
     let path = socket_path();
     if let Some(dir) = path.parent() {
@@ -31,6 +55,13 @@ pub fn prepare_socket() -> Result<PathBuf> {
         }
     }
     if path.exists() {
+        #[cfg(unix)]
+        if std::os::unix::net::UnixStream::connect(&path).is_ok() {
+            return Err(anyhow!(
+                "another dsh-desktop-linux instance is already running (socket {})",
+                path.display()
+            ));
+        }
         let _ = std::fs::remove_file(&path);
     }
     Ok(path)
@@ -62,12 +93,12 @@ pub async fn listen(path: PathBuf) -> Result<()> {
                                     .and_then(|x| x.as_str())
                                     .unwrap_or("DeepSeek Harness");
                                 let body = v.get("body").and_then(|x| x.as_str()).unwrap_or("");
-                                let urgency = v
-                                    .get("urgency")
-                                    .and_then(|x| x.as_str())
-                                    .unwrap_or("normal");
-                                fire(summary.to_string(), body.to_string(), urgency.to_string())
-                                    .await;
+                                let urgency = Urgency::parse(
+                                    v.get("urgency")
+                                        .and_then(|x| x.as_str())
+                                        .unwrap_or("normal"),
+                                );
+                                fire(summary.to_string(), body.to_string(), urgency).await;
                             }
                             Err(e) => tracing::warn!(error = %e, "invalid notify payload"),
                         }
@@ -79,13 +110,14 @@ pub async fn listen(path: PathBuf) -> Result<()> {
     }
 }
 
-pub async fn fire(summary: String, body: String, urgency: String) {
+pub async fn fire(summary: String, body: String, urgency: Urgency) {
     tokio::task::spawn_blocking(move || {
-        use notify_rust::{Notification, Urgency};
-        let urg = match urgency.as_str() {
-            "low" => Urgency::Low,
-            "critical" => Urgency::Critical,
-            _ => Urgency::Normal,
+        use notify_rust::Notification;
+        use notify_rust::Urgency as BusUrgency;
+        let urg = match urgency {
+            Urgency::Low => BusUrgency::Low,
+            Urgency::Normal => BusUrgency::Normal,
+            Urgency::Critical => BusUrgency::Critical,
         };
         match Notification::new()
             .appname("DeepSeek Harness")
@@ -101,4 +133,17 @@ pub async fn fire(summary: String, body: String, urgency: String) {
     })
     .await
     .ok();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Urgency;
+
+    #[test]
+    fn urgency_parse_is_strict_about_known_values() {
+        assert_eq!(Urgency::parse("low"), Urgency::Low);
+        assert_eq!(Urgency::parse("critical"), Urgency::Critical);
+        assert_eq!(Urgency::parse("normal"), Urgency::Normal);
+        assert_eq!(Urgency::parse("bogus"), Urgency::Normal);
+    }
 }

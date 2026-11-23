@@ -93,7 +93,9 @@ Test: in the chat panel, ask the agent "What is the status of sshd.service? Use 
 
 - **Backend failed to start: no dsh backend found** — run `npm install -g @deepseek-ai/dsh`, ensure `command -v dsh` resolves. GUI launches inherit a minimal PATH; the wrapper now merges your login-shell PATH, but `~/.npm-global/bin` and nvm paths must be exported from your shell profile.
 - **`failed to parse overlay ... cordis.patch.yml`** — a v0.1.0 installer appended a `- insert:` row after the stock `[]`, which is invalid YAML. Rerun `./scripts/install-plugin.sh`; it removes the legacy row and registers the bundle instead.
-- **Window blank for >120s** — check terminal for `dsh.stderr` lines. Set `DSH_STARTUP_TIMEOUT_SECS=240` for a slow first boot.
+- **Window blank for >120s** — check terminal/journal for `dsh.stderr` lines (now enabled at the default log level). Set `DSH_STARTUP_TIMEOUT_SECS=240` for a slow first boot. If the port never opens, the wrapper exits with `backend never accepted connections` instead of showing a blank window.
+- **"another dsh-desktop-linux instance is already running"** — a second launch refuses to start rather than stealing the notify socket. Quit the first instance (tray → Quit), or remove the stale socket in `$XDG_RUNTIME_DIR/dsh-desktop-linux/` if no wrapper is running.
+- **Links inside the window do nothing** — navigation is restricted to the backend origin so the local token cannot be sent to another host; external links are blocked by design.
 - **ACCOUNT_QUOTA in chat** — DeepSeek API quota exhausted, unrelated to wrapper
 - **Ctrl+Shift+D does nothing (Wayland)** — use the SIGUSR1 fallback above
 - **No tray icon, or window close quits** — `libayatana-appindicator3` is missing; install it to restore close-to-tray.
@@ -119,7 +121,8 @@ Environment variables:
 - `DSH_PROFILE` — which profile to install the plugin into (default: `web`)
 - `DSH_HOME` — DSH home root (default: `~/.dsh`)
 - `DSH_STARTUP_TIMEOUT_SECS` — backend URL wait budget (default: `120`)
-- `RUST_LOG=dsh_desktop_linux=debug` — verbose wrapper logging
+- `DSH_ALLOW_ANY_BACKEND_HOST=1` — escape hatch for non-loopback backend URLs (default: rejected; the token is a local credential)
+- `RUST_LOG=dsh_desktop_linux=debug,dsh=debug` — verbose wrapper + backend logging. The token is redacted in all log output.
 
 ## License
 

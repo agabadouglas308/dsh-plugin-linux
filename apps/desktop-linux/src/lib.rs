@@ -9,11 +9,9 @@ mod notify;
 
 use anyhow::{anyhow, Context, Result};
 use once_cell::sync::OnceCell;
-use regex::Regex;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::LazyLock;
 use std::time::Duration;
 use tauri::{
     image::Image,
@@ -25,21 +23,151 @@ use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut,
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
-static URL_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(https?://[^\s/]+)/\?token=([A-Za-z0-9_\-]+)").unwrap());
-
-static BACKEND_PGID: OnceCell<u32> = OnceCell::new();
+static BACKEND_PGID: OnceCell<ProcessGroup> = OnceCell::new();
 static NOTIFY_SOCK: OnceCell<PathBuf> = OnceCell::new();
 /// Whether a tray icon was created; without one, closing the window must exit.
 static TRAY_READY: AtomicBool = AtomicBool::new(false);
 /// Set while a controlled shutdown is in progress so the backend waiter stays quiet.
 static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 
+/// The tokenized URL printed by `dsh web`. The token is a local credential: it
+/// is only exposed through `full()`/`into_url()`, never through `Display` or
+/// tracing fields.
+#[derive(Clone, PartialEq, Eq)]
+struct StartupUrl {
+    origin: String,
+    token: String,
+}
+
+impl std::fmt::Debug for StartupUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StartupUrl")
+            .field("origin", &self.origin)
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}
+
+impl StartupUrl {
+    fn authority(&self) -> &str {
+        self.origin
+            .split_once("://")
+            .map(|(_, authority)| authority)
+            .unwrap_or(&self.origin)
+    }
+
+    fn full(&self) -> String {
+        format!("{}/?token={}", self.origin, self.token)
+    }
+}
+
+/// Parse the tokenized URL out of a backend stdout line.
+///
+/// `allow_any_host` is an escape hatch for non-standard backends; by default
+/// only loopback origins are accepted so a stray URL cannot make the webview
+/// ship a local token to a remote host.
+fn parse_startup_url(line: &str, allow_any_host: bool) -> Option<StartupUrl> {
+    let (scheme, rest) = if let Some((_, rest)) = line.split_once("http://") {
+        ("http", rest)
+    } else if let Some((_, rest)) = line.split_once("https://") {
+        ("https", rest)
+    } else {
+        return None;
+    };
+    let end = rest
+        .find(|c: char| c.is_whitespace() || c == '"' || c == '\'')
+        .unwrap_or(rest.len());
+    let (authority, token) = rest[..end].split_once("/?token=")?;
+    if authority.is_empty()
+        || token.is_empty()
+        || !token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return None;
+    }
+    if !allow_any_host && !is_loopback_authority(authority) {
+        return None;
+    }
+    Some(StartupUrl {
+        origin: format!("{scheme}://{authority}"),
+        token: token.to_string(),
+    })
+}
+
+fn is_loopback_authority(authority: &str) -> bool {
+    let host = authority
+        .rsplit_once('@')
+        .map(|(_, h)| h)
+        .unwrap_or(authority);
+    let host = if let Some(inner) = host
+        .strip_prefix('[')
+        .and_then(|s| s.split_once(']').map(|(h, _)| h))
+    {
+        inner
+    } else {
+        host.split(':').next().unwrap_or(host)
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host.starts_with("127.")
+        || host == "::1"
+        || host == "0.0.0.0"
+        || host == "::"
+}
+
+/// Replace a token value in a log line so backend stdout can be debug-logged
+/// without publishing the credential.
+fn redact_token(line: &str) -> String {
+    let Some(idx) = line.find("token=") else {
+        return line.to_string();
+    };
+    let head = &line[..idx + "token=".len()];
+    let tail = &line[idx + "token=".len()..];
+    let end = tail
+        .find(|c: char| c.is_whitespace() || c == '&' || c == '"' || c == '\'')
+        .unwrap_or(tail.len());
+    format!("{head}<redacted>{}", &tail[end..])
+}
+
+/// A backend process group, killed as a unit so grandchildren cannot survive
+/// the wrapper.
+struct ProcessGroup(u32);
+
+impl ProcessGroup {
+    fn signal(&self, sig: &str) -> bool {
+        std::process::Command::new("sh")
+            .args(["-c", &format!("kill -{sig} -- -{} 2>/dev/null", self.0)])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    fn terminate(&self) {
+        let _ = self.signal("TERM");
+        // Poll for up to ~400ms, then escalate. `kill -0` probes the group
+        // without delivering a signal.
+        for _ in 0..8 {
+            if !self.signal("0") {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = self.signal("KILL");
+    }
+}
+
+fn terminate_backend() {
+    if let Some(pg) = BACKEND_PGID.get() {
+        tracing::info!(pgid = pg.0, "terminating backend process group");
+        pg.terminate();
+    }
+}
+
 pub fn run() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "dsh_desktop_linux=info".into()),
+                .unwrap_or_else(|_| "dsh_desktop_linux=info,dsh=warn".into()),
         )
         .init();
 
@@ -54,6 +182,28 @@ pub fn run() {
                 .build(),
         )
         .setup(|app| {
+            // Single-instance guard: bind ownership is decided by the notify
+            // socket. Refuse to start a second backend if one is already live.
+            let sock = match notify::prepare_socket() {
+                Ok(path) => path,
+                Err(e) => {
+                    tracing::error!(error = %e, "refusing to start a second instance");
+                    let handle = app.handle().clone();
+                    tauri::async_runtime::spawn(async move {
+                        notify::fire("DeepSeek Harness".into(), e.to_string(), notify::Urgency::Critical).await;
+                        handle.exit(1);
+                    });
+                    return Ok(());
+                }
+            };
+            let _ = NOTIFY_SOCK.set(sock.clone());
+            let sp = sock.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = notify::listen(sp).await {
+                    tracing::warn!(error = %e, "notify listener failed");
+                }
+            });
+
             // GUI launches inherit a minimal PATH that often omits npm/nvm
             // locations. Merge the login-shell PATH before probing for `dsh`.
             ensure_login_path();
@@ -120,7 +270,7 @@ pub fn run() {
                         notify::fire(
                             "DeepSeek Harness".into(),
                             "Test notification triggered via SIGUSR2".into(),
-                            "normal".into(),
+                            notify::Urgency::Normal,
                         )
                         .await;
                     }
@@ -145,29 +295,16 @@ pub fn run() {
                 });
             }
 
-            // ── Notify socket (bridge for backend / plugins) ─────────────
-            match notify::prepare_socket() {
-                Ok(path) => {
-                    let _ = NOTIFY_SOCK.set(path.clone());
-                    let sp = path.clone();
-                    tauri::async_runtime::spawn(async move {
-                        if let Err(e) = notify::listen(sp).await {
-                            tracing::warn!(error = %e, "notify listener failed");
-                        }
-                    });
-                }
-                Err(e) => tracing::warn!(error = %e, "notify socket prepare failed"),
-            }
-
             // ── Spawn backend, then open window ──────────────────────────
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 match spawn_backend(handle.clone()).await {
-                    Ok(url) => {
-                        tracing::info!(%url, "backend ready, opening window");
-                        if let Err(e) = open_main_window(&handle, &url) {
+                    Ok(startup) => {
+                        // Never log the token; only the origin is safe.
+                        tracing::info!(origin = %startup.origin, "backend ready, opening window");
+                        if let Err(e) = open_main_window(&handle, &startup) {
                             tracing::error!(error = %e, "failed to open window");
-                            kill_backend();
+                            terminate_backend();
                             handle.exit(1);
                         }
                     }
@@ -176,9 +313,10 @@ pub fn run() {
                         notify::fire(
                             "DeepSeek Harness".into(),
                             format!("Backend failed to start: {e}"),
-                            "critical".into(),
+                            notify::Urgency::Critical,
                         )
                         .await;
+                        terminate_backend();
                         handle.exit(1);
                     }
                 }
@@ -190,7 +328,7 @@ pub fn run() {
         .run(|_app, event| {
             if let RunEvent::Exit = event {
                 SHUTTING_DOWN.store(true, Ordering::SeqCst);
-                kill_backend();
+                terminate_backend();
                 if let Some(sock) = NOTIFY_SOCK.get() {
                     notify::cleanup(sock);
                 }
@@ -280,7 +418,7 @@ fn shutdown_and_exit(app: &tauri::AppHandle) {
     if SHUTTING_DOWN.swap(true, Ordering::SeqCst) {
         return;
     }
-    kill_backend();
+    terminate_backend();
     if let Some(sock) = NOTIFY_SOCK.get() {
         notify::cleanup(sock);
     }
@@ -348,28 +486,17 @@ fn build_tray(app: &tauri::AppHandle) -> Result<()> {
     Ok(())
 }
 
-fn kill_backend() {
-    let Some(&pgid) = BACKEND_PGID.get() else {
-        return;
-    };
-    tracing::info!(pgid, "killing backend process group");
-    let _ = std::process::Command::new("sh")
-        .args([
-            "-c",
-            &format!("kill -TERM -- -{} 2>/dev/null || true", pgid),
-        ])
-        .status();
-    std::thread::sleep(Duration::from_millis(400));
-    let _ = std::process::Command::new("sh")
-        .args([
-            "-c",
-            &format!("kill -KILL -- -{} 2>/dev/null || true", pgid),
-        ])
-        .status();
-}
-
-fn open_main_window(app: &tauri::AppHandle, url: &str) -> Result<()> {
+fn open_main_window(app: &tauri::AppHandle, startup: &StartupUrl) -> Result<()> {
+    let url = startup.full();
+    let allowed_origin = startup.origin.clone();
     let win = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url.parse()?))
+        .on_navigation(move |target| {
+            let allowed = target.as_str().starts_with(&allowed_origin);
+            if !allowed {
+                tracing::warn!(url = %target, "blocked webview navigation away from backend");
+            }
+            allowed
+        })
         .title("DeepSeek Harness")
         .inner_size(1280.0, 800.0)
         .min_inner_size(900.0, 600.0)
@@ -455,7 +582,7 @@ fn locate_dsh_backend() -> Result<DshBackend> {
     ))
 }
 
-async fn spawn_backend(app: tauri::AppHandle) -> Result<String> {
+async fn spawn_backend(app: tauri::AppHandle) -> Result<StartupUrl> {
     let backend = locate_dsh_backend()?;
     tracing::info!(
         bin = %backend.bin,
@@ -482,23 +609,26 @@ async fn spawn_backend(app: tauri::AppHandle) -> Result<String> {
     let mut child = cmd.spawn().context("spawn dsh web")?;
 
     let pid = child.id().ok_or_else(|| anyhow!("child pid missing"))?;
-    let _ = BACKEND_PGID.set(pid);
+    let _ = BACKEND_PGID.set(ProcessGroup(pid));
     tracing::info!(pgid = pid, "backend spawned");
 
     let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
     let stderr = child.stderr.take().ok_or_else(|| anyhow!("no stderr"))?;
 
-    let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+    let allow_any_host = std::env::var("DSH_ALLOW_ANY_BACKEND_HOST")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<StartupUrl>();
     let tx = std::sync::Arc::new(tokio::sync::Mutex::new(Some(tx)));
 
     tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            tracing::debug!(target: "dsh.stdout", "{}", line);
-            if let Some(c) = URL_RE.captures(&line) {
-                let url = format!("{}/?token={}", &c[1], &c[2]);
+            tracing::debug!(target: "dsh.stdout", "{}", redact_token(&line));
+            if let Some(startup) = parse_startup_url(&line, allow_any_host) {
                 if let Some(s) = tx.lock().await.take() {
-                    let _ = s.send(url);
+                    let _ = s.send(startup);
                 }
                 break;
             }
@@ -518,23 +648,40 @@ async fn spawn_backend(app: tauri::AppHandle) -> Result<String> {
         .filter(|v| *v > 0)
         .unwrap_or(120);
 
-    let url = match tokio::time::timeout(Duration::from_secs(startup_secs), rx).await {
+    let startup = match tokio::time::timeout(Duration::from_secs(startup_secs), rx).await {
         Ok(Ok(u)) => u,
-        Ok(Err(_)) => return Err(anyhow!("backend stdout closed before URL")),
-        Err(_) => return Err(anyhow!("backend did not print URL in {startup_secs}s")),
+        Ok(Err(_)) => {
+            terminate_backend();
+            let _ = child.wait().await;
+            return Err(anyhow!("backend stdout closed before URL"));
+        }
+        Err(_) => {
+            terminate_backend();
+            let _ = child.wait().await;
+            return Err(anyhow!("backend did not print URL in {startup_secs}s"));
+        }
     };
 
-    let authority = url
-        .split_once("://")
-        .and_then(|(_, rest)| rest.split('/').next())
-        .ok_or_else(|| anyhow!("malformed URL: {url}"))?
-        .to_owned();
-
+    // The URL can be printed before the listener accepts connections. Do not
+    // open a blank window if readiness never happens.
+    let authority = startup.authority().to_owned();
+    let mut ready = false;
     for _ in 0..40 {
+        if let Ok(Some(status)) = child.try_wait() {
+            terminate_backend();
+            let _ = child.wait().await;
+            return Err(anyhow!("backend exited during startup with {status}"));
+        }
         if tokio::net::TcpStream::connect(&authority).await.is_ok() {
+            ready = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    if !ready {
+        terminate_backend();
+        let _ = child.wait().await;
+        return Err(anyhow!("backend never accepted connections on {authority}"));
     }
 
     tokio::spawn(async move {
@@ -548,7 +695,7 @@ async fn spawn_backend(app: tauri::AppHandle) -> Result<String> {
             notify::fire(
                 "DeepSeek Harness".into(),
                 format!("Backend exited unexpectedly ({exit:?})"),
-                "critical".into(),
+                notify::Urgency::Critical,
             )
             .await;
         }
@@ -558,5 +705,60 @@ async fn spawn_backend(app: tauri::AppHandle) -> Result<String> {
         app.exit(if failed { 1 } else { 0 });
     });
 
-    Ok(url)
+    Ok(startup)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_loopback_authority, parse_startup_url, redact_token};
+
+    #[test]
+    fn parses_loopback_http_url() {
+        let startup = parse_startup_url(
+            "dsh listening on http://127.0.0.1:43127/?token=abc_123-XYZ",
+            false,
+        )
+        .unwrap();
+        assert_eq!(startup.origin, "http://127.0.0.1:43127");
+        assert_eq!(startup.authority(), "127.0.0.1:43127");
+        assert_eq!(startup.full(), "http://127.0.0.1:43127/?token=abc_123-XYZ");
+    }
+
+    #[test]
+    fn parses_https_localhost_and_ipv6() {
+        for line in [
+            "https://localhost:8443/?token=T0ken",
+            "http://[::1]:43127/?token=T0ken",
+        ] {
+            let startup = parse_startup_url(line, false).expect(line);
+            assert_eq!(startup.token, "T0ken");
+        }
+    }
+
+    #[test]
+    fn rejects_remote_and_malformed_urls() {
+        assert!(parse_startup_url("http://example.com:1234/?token=abc", false).is_none());
+        assert!(parse_startup_url("http://127.0.0.1:1234/?token=", false).is_none());
+        assert!(parse_startup_url("http://127.0.0.1:1234/nope", false).is_none());
+        assert!(parse_startup_url("nothing here", false).is_none());
+        assert!(parse_startup_url("http://example.com:1234/?token=abc", true).is_some());
+    }
+
+    #[test]
+    fn redacts_token_in_log_lines() {
+        let line = "GET http://127.0.0.1:43127/?token=super-secret HTTP/1.1";
+        let redacted = redact_token(line);
+        assert!(!redacted.contains("super-secret"));
+        assert!(redacted.contains("<redacted>"));
+    }
+
+    #[test]
+    fn loopback_authority_check() {
+        for host in ["127.0.0.1:9", "localhost:9", "[::1]:9", "user@127.0.0.2:9"] {
+            assert!(is_loopback_authority(host), "{host}");
+        }
+        for host in ["evil.example:9", "example.com@evil.net:9"] {
+            assert!(!is_loopback_authority(host), "{host}");
+        }
+    }
 }

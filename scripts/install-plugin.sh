@@ -66,7 +66,11 @@ manifest.dsh ??= {}
 manifest.dsh.profile ??= {}
 const bundles = Array.isArray(manifest.dsh.profile.bundles) ? manifest.dsh.profile.bundles : []
 manifest.dsh.profile.bundles = [...bundles.filter(name => name !== PKG_NAME), PKG_NAME]
-fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`)
+// Write atomically: an interrupted install must not leave a truncated manifest
+// that prevents dsh from booting.
+const tmpPath = `${manifestPath}.tmp-${process.pid}`
+fs.writeFileSync(tmpPath, `${JSON.stringify(manifest, null, 2)}\n`)
+fs.renameSync(tmpPath, manifestPath)
 console.log(`      ${path.relative(PROFILE_DIR, manifestPath)}: bundles = ${manifest.dsh.profile.bundles.join(', ')}`)
 
 // Older versions of this installer appended a `- insert:` row after the stock
@@ -91,7 +95,9 @@ if (fs.existsSync(PATCH_FILE)) {
   if (changed) {
     const meaningful = kept.filter(line => line.trim() !== '' && !line.trim().startsWith('#'))
     if (meaningful.length === 0) kept.push('[]')
-    fs.writeFileSync(PATCH_FILE, `${kept.join('\n').replace(/\n+$/, '')}\n`)
+    const tmpPatch = `${PATCH_FILE}.tmp-${process.pid}`
+    fs.writeFileSync(tmpPatch, `${kept.join('\n').replace(/\n+$/, '')}\n`)
+    fs.renameSync(tmpPatch, PATCH_FILE)
     console.log(`      removed the legacy linux-system row from ${path.basename(PATCH_FILE)}`)
   }
 }
@@ -104,7 +110,7 @@ if command -v dsh >/dev/null 2>&1; then
     echo "$dump" | tail -n 8 >&2
     exit 1
   fi
-  if ! grep -q "name: '$PKG_NAME'" <<<"$dump"; then
+  if ! grep -qF "$PKG_NAME" <<<"$dump"; then
     die "bundle registered but dsh did not compose it; check the output of: dsh --profile $PROFILE_NAME --dump-config"
   fi
   echo "      composition OK"

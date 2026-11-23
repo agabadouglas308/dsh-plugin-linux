@@ -55,6 +55,7 @@ function spawnWithStdin(
     }
     const child = spawn(cmd, args, { stdio: ['pipe', 'ignore', 'pipe'] })
     const errChunks: Buffer[] = []
+    let stdinError: Error | null = null
     let settled = false
     const finish = (error?: Error): void => {
       if (settled) return
@@ -74,9 +75,15 @@ function spawnWithStdin(
     }, timeoutMs)
     signal?.addEventListener('abort', onAbort, { once: true })
     child.stderr?.on('data', (d: Buffer) => errChunks.push(d))
+    // Clipboard helpers routinely exit before consuming every byte. An EPIPE
+    // on stdin is expected then; the close code decides success. Any other
+    // stream error must still fail the tool call instead of crashing dsh.
+    child.stdin?.on('error', (e: NodeJS.ErrnoException) => {
+      if (e.code !== 'EPIPE') stdinError = e
+    })
     child.on('error', (e) => finish(e))
     child.on('close', (code) => {
-      if (code === 0) { finish(); return }
+      if (code === 0) { finish(stdinError ?? undefined); return }
       finish(new Error(`${cmd} exited ${code}: ${Buffer.concat(errChunks).toString('utf8').trim()}`))
     })
     child.stdin?.end(input)
@@ -172,7 +179,7 @@ export function apply(ctx: Context): void {
     async execute(args: { unit: string; scope?: Scope }, exec: ToolExec = {}) {
       const scope: Scope = args.scope ?? 'system'
       const props = 'LoadState,ActiveState,SubState,UnitFileState,MainPID,Description,FragmentPath,ExecMainStartTimestamp'
-      const { stdout } = await runCmd('systemctl', [...scopeArgs(scope), 'show', args.unit, '--property=' + props, '--no-pager'], 15_000, exec)
+      const { stdout } = await runCmd('systemctl', [...scopeArgs(scope), 'show', '--property=' + props, '--no-pager', '--', args.unit], 15_000, exec)
       const info: Record<string, string> = {}
       for (const line of stdout.trim().split('\n')) {
         const eq = line.indexOf('=')
@@ -198,7 +205,7 @@ export function apply(ctx: Context): void {
     isConcurrencySafe: () => false,
     async execute(args: { unit: string; action: 'start' | 'stop' | 'restart' | 'enable' | 'disable'; scope?: Scope }, exec: ToolExec = {}) {
       const scope: Scope = args.scope ?? 'system'
-      const { stdout, stderr } = await runCmd('systemctl', [...scopeArgs(scope), args.action, args.unit], 15_000, exec)
+      const { stdout, stderr } = await runCmd('systemctl', [...scopeArgs(scope), args.action, '--', args.unit], 15_000, exec)
       return { unit: args.unit, action: args.action, scope, stdout: stdout.trim(), stderr: stderr.trim() }
     },
   }))

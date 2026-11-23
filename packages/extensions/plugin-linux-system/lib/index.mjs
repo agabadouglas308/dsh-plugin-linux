@@ -30,6 +30,7 @@ function spawnWithStdin(cmd, args, input, { timeoutMs = 5e3, signal } = {}) {
 			"pipe"
 		] });
 		const errChunks = [];
+		let stdinError = null;
 		let settled = false;
 		const finish = (error) => {
 			if (settled) return;
@@ -49,10 +50,13 @@ function spawnWithStdin(cmd, args, input, { timeoutMs = 5e3, signal } = {}) {
 		}, timeoutMs);
 		signal?.addEventListener("abort", onAbort, { once: true });
 		child.stderr?.on("data", (d) => errChunks.push(d));
+		child.stdin?.on("error", (e) => {
+			if (e.code !== "EPIPE") stdinError = e;
+		});
 		child.on("error", (e) => finish(e));
 		child.on("close", (code) => {
 			if (code === 0) {
-				finish();
+				finish(stdinError ?? void 0);
 				return;
 			}
 			finish(/* @__PURE__ */ new Error(`${cmd} exited ${code}: ${Buffer.concat(errChunks).toString("utf8").trim()}`));
@@ -198,9 +202,10 @@ function apply(ctx) {
 			const { stdout } = await runCmd("systemctl", [
 				...scopeArgs(scope),
 				"show",
-				args.unit,
 				"--property=LoadState,ActiveState,SubState,UnitFileState,MainPID,Description,FragmentPath,ExecMainStartTimestamp",
-				"--no-pager"
+				"--no-pager",
+				"--",
+				args.unit
 			], 15e3, exec);
 			const info = {};
 			for (const line of stdout.trim().split("\n")) {
@@ -254,6 +259,7 @@ function apply(ctx) {
 			const { stdout, stderr } = await runCmd("systemctl", [
 				...scopeArgs(scope),
 				args.action,
+				"--",
 				args.unit
 			], 15e3, exec);
 			return {
